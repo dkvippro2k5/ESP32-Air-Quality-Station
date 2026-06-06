@@ -76,3 +76,14 @@ Desktop.ini
 *.workspace # General workspace files, can be from various tools
 *.suo       # Visual Studio Solution User Options
 *.sln.docstates # Visual Studio
+
+# Bỏ qua các thư mục và file sinh ra trong quá trình biên dịch
+build/
+managed_components/
+dependencies.lock
+sdkconfig
+sdkconfig.old
+
+# Bỏ qua các file cấu hình IDE ẩn
+.vscode/
+.devcontainer/
