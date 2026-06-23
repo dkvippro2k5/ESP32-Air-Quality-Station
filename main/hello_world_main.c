@@ -1,210 +1,286 @@
+/*
+ * Mô tả: Hệ thống Trạm Quan Trắc Không Khí IoT hoàn chỉnh (Wi-Fi + MQTT HiveMQ + OLED + DHT11 + PMS7003)
+ * Phiên bản tối ưu hóa: Hardware Timer & UART Interrupts. Tần số lấy mẫu 5s.
+ */
+
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "driver/uart.h"
 #include "driver/gpio.h"
+#include "esp_timer.h"
 #include "esp_log.h"
-#include "esp_spiffs.h"
-#include "nvs_flash.h"
 #include "esp_wifi.h"
-#include "esp_netif.h"
 #include "esp_event.h"
-#include "esp_http_server.h"
+#include "nvs_flash.h"
 #include "mqtt_client.h"
-#include "esp_rom_sys.h"
+#include "esp_crt_bundle.h"
 
-// ----------------- CẤU HÌNH HỆ THỐNG -----------------
-#define WIFI_SSID      "455 Vu Tong Phan"
-#define WIFI_PASS      "12345679@"
-#define MQTT_BROKER    "mqtt://broker.hivemq.com"
-#define MQTT_TOPIC     "hust/kien/air_quality"
+// Thư viện ngoại vi
+#include "ssd1306.h"
+#include "dht.h"
 
-#define DHT_PIN        GPIO_NUM_21
-static const char *TAG = "SUPER_IOT_STATION";
-esp_mqtt_client_handle_t mqtt_client;
-void mqtt_app_start(void);
+#define WIFI_SSID       "iPhone"
+#define WIFI_PASS       "123456789"
+#define MQTT_URI        "mqtts://2cf8a119a7c74d3891fc09c9ca7136f9.s1.eu.hivemq.cloud:8883"
+#define MQTT_TOPIC      "hust/kien/air_quality"
 
-// ----------------- 1. QUẢN LÝ SPIFFS -----------------
-void init_spiffs(void) {
-    esp_vfs_spiffs_conf_t conf = { .base_path = "/spiffs", .partition_label = "storage", .max_files = 5, .format_if_mount_failed = true };
-    esp_vfs_spiffs_register(&conf);
-}
+#define PMS_UART_PORT   UART_NUM_2
+#define PMS_TX_PIN      GPIO_NUM_17 
+#define PMS_RX_PIN      GPIO_NUM_16 
+#define BUF_SIZE        (1024)
+#define DHT_PIN         GPIO_NUM_4
+#define I2C_MASTER_SDA  21
+#define I2C_MASTER_SCL  22
 
-void log_sensor_data(float temp, float hum) {
-    FILE* f = fopen("/spiffs/sensor_log.csv", "a");
-    if (f != NULL) {
-        // Ghi kèm một mốc đếm (hoặc sau này bạn có thể cấy thêm thời gian thực RTC)
-        fprintf(f, "%.1f,%.1f\n", temp, hum);
-        fclose(f);
-    }
-}
+// Cấu hình chu kỳ lấy mẫu (5 giây = 5.000.000 micro giây)
+#define SAMPLING_PERIOD_US 5000000
 
-// Endpoint xử lý trang chủ: http://<IP_ESP32>/
-static esp_err_t root_get_handler(httpd_req_t *req) {
-    // Mã HTML của trang web (Có màu sắc và nút bấm)
-    const char* html_page = 
-        "<html><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">"
-        "<title>Trạm Đo Không Khí</title>"
-        "<style>body{font-family: Arial; text-align: center; margin-top: 50px; background-color: #f4f4f9;}"
-        "button{padding: 15px 30px; font-size: 18px; color: white; background-color: #007bff; border: none; border-radius: 5px; cursor: pointer; box-shadow: 0 4px 6px rgba(0,0,0,0.1);}"
-        "button:hover{background-color: #0056b3;}</style></head>"
-        "<body><h1>Trạm Quan Trắc IoT Của Kiên</h1>"
-        "<p>Dữ liệu đang được ghi liên tục vào bộ nhớ Flash SPIFFS.</p>"
-        "<a href=\"/download\"><button>📥 Tải File CSV Lịch Sử</button></a>"
-        "</body></html>";
+static const char *TAG = "TRAM_IOT_MAIN";
+static EventGroupHandle_t s_wifi_event_group;
+#define WIFI_CONNECTED_BIT BIT0
 
-    httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, html_page, HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
-}
+volatile int global_pm2_5 = 0;
+volatile int global_pm10  = 0;
 
-// ----------------- 2. WEB SERVER (TẢI FILE) -----------------
-// Endpoint xử lý khi người dùng truy cập: http://<IP_ESP32>/download
-static esp_err_t download_get_handler(httpd_req_t *req) {
-    FILE* f = fopen("/spiffs/sensor_log.csv", "r");
-    if (f == NULL) {
-        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "File not found or empty");
-        return ESP_FAIL;
-    }
+SSD1306_t dev;
+esp_mqtt_client_handle_t mqtt_client = NULL;
 
-    // Ép trình duyệt hiểu đây là file CSV cần tải về
-    httpd_resp_set_type(req, "text/csv");
-    httpd_resp_set_hdr(req, "Content-Disposition", "attachment; filename=\"data_log.csv\"");
+// RTOS Sync Objects
+static QueueHandle_t uart_queue;
+static QueueHandle_t data_queue;
+static SemaphoreHandle_t timer_sem;
 
-    char chunk[128];
-    size_t chunk_size;
-    // Đọc từng khúc nhỏ và gửi đi để không làm tràn RAM
-    while ((chunk_size = fread(chunk, 1, sizeof(chunk), f)) > 0) {
-        httpd_resp_send_chunk(req, chunk, chunk_size);
-    }
-    httpd_resp_send_chunk(req, NULL, 0); // Đánh dấu kết thúc
-    fclose(f);
-    ESP_LOGI(TAG, "Nguoi dung vua tai file CSV thanh cong!");
-    return ESP_OK;
-}
+typedef struct {
+    float temp;
+    float hum;
+    int pm25;
+    int pm10;
+} sensor_data_t;
 
-void start_webserver(void) {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
-    httpd_handle_t server = NULL;
-    if (httpd_start(&server, &config) == ESP_OK) {
-        // Đăng ký trang chủ '/'
-        httpd_uri_t root_uri = { .uri = "/", .method = HTTP_GET, .handler = root_get_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &root_uri);
-
-        // Đăng ký đường dẫn tải file '/download'
-        httpd_uri_t download_uri = { .uri = "/download", .method = HTTP_GET, .handler = download_get_handler, .user_ctx = NULL };
-        httpd_register_uri_handler(server, &download_uri);
-        
-        ESP_LOGI(TAG, "Web Server da chay. Truy cap IP de xem trang chu.");
-    }
-}
-
-// ----------------- 3. KẾT NỐI WIFI & MQTT -----------------
+// --- QUẢN LÝ SỰ KIỆN WIFI ---
 static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
-    if (event_id == WIFI_EVENT_STA_START) esp_wifi_connect();
-    else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        ESP_LOGW(TAG, "Mat ket noi Wi-Fi, dang thu lai...");
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
         esp_wifi_connect();
-    } else if (event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t* event = (ip_event_got_ip_t*) event_data;
-        ESP_LOGI(TAG, "Da ket noi Wi-Fi! DUC CHI IP: " IPSTR, IP2STR(&event->ip_info.ip));
-        start_webserver(); // Có mạng mới bật Web Server
-        mqtt_app_start();  // <--- THÊM DÒNG NÀY VÀO ĐÂY: Có mạng mới bật MQTT
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        esp_wifi_connect();
+        ESP_LOGW(TAG, "Mat ket noi Wi-Fi, dang thu lai...");
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        ESP_LOGI(TAG, "Da ket noi Wi-Fi, cap duoc IP!");
     }
 }
 
 void wifi_init_sta(void) {
-    esp_netif_init();
-    esp_event_loop_create_default();
+    s_wifi_event_group = xEventGroupCreate();
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
+
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-    esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL);
-    esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL);
-    wifi_config_t wifi_config = { .sta = { .ssid = WIFI_SSID, .password = WIFI_PASS } };
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_set_config(WIFI_IF_STA, &wifi_config);
-    esp_wifi_start();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    esp_event_handler_instance_t instance_any_id;
+    esp_event_handler_instance_t instance_got_ip;
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, &instance_any_id));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, &instance_got_ip));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASS,
+        },
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    
+    xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
+}
+
+// --- QUẢN LÝ SỰ KIỆN MQTT ---
+static void mqtt_event_handler(void *handler_args, esp_event_base_t event_base, int32_t event_id, void *event_data) {
+    esp_mqtt_event_handle_t event = event_data;
+    switch ((esp_mqtt_event_id_t)event_id) {
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "MQTT connected to HiveMQ Cloud!");
+            break;
+        case MQTT_EVENT_DISCONNECTED:
+            ESP_LOGW(TAG, "MQTT disconnected!");
+            break;
+        default:
+            break;
+    }
 }
 
 void mqtt_app_start(void) {
-    esp_mqtt_client_config_t mqtt_cfg = { .broker.address.uri = MQTT_BROKER };
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = MQTT_URI,
+        .broker.verification.crt_bundle_attach = esp_crt_bundle_attach,
+        .credentials.username = "esp32_kien",
+        .credentials.authentication.password = "Kien123456@",
+    };
+    
     mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(mqtt_client);
 }
 
-// ----------------- 4. ĐỌC CẢM BIẾN DHT -----------------
-// ----------------- 4. ĐỌC CẢM BIẾN DHT (PHIÊN BẢN CHỐNG NHIỄU) -----------------
-int dht_read_data(float *humidity, float *temperature) {
-    uint8_t data[5] = {0};
-    
-    // Tạo "ổ khóa" ngắt của hệ điều hành
-    static portMUX_TYPE mux = portMUX_INITIALIZER_UNLOCKED;
-
-    gpio_reset_pin(DHT_PIN);
-    gpio_set_direction(DHT_PIN, GPIO_MODE_OUTPUT);
-    gpio_set_level(DHT_PIN, 0);
-    vTaskDelay(pdMS_TO_TICKS(20)); // Đợi 20ms cho DHT chuẩn bị
-    gpio_set_level(DHT_PIN, 1);
-    esp_rom_delay_us(30);
-    gpio_set_direction(DHT_PIN, GPIO_MODE_INPUT);
-
-    // --- BẮT ĐẦU VÙNG ƯU TIÊN CAO: Tạm khóa ngắt Wi-Fi ---
-    portENTER_CRITICAL(&mux);
-
-    int timeout = 0;
-    while(gpio_get_level(DHT_PIN) == 1) { if(++timeout > 500) { portEXIT_CRITICAL(&mux); return -1; } esp_rom_delay_us(1); }
-    timeout = 0; while(gpio_get_level(DHT_PIN) == 0) { if(++timeout > 500) { portEXIT_CRITICAL(&mux); return -1; } esp_rom_delay_us(1); }
-    timeout = 0; while(gpio_get_level(DHT_PIN) == 1) { if(++timeout > 500) { portEXIT_CRITICAL(&mux); return -1; } esp_rom_delay_us(1); }
-
-    for (int i = 0; i < 40; i++) {
-        timeout = 0; while(gpio_get_level(DHT_PIN) == 0) { if(++timeout > 500) { portEXIT_CRITICAL(&mux); return -1; } esp_rom_delay_us(1); }
-        uint32_t t = 0; while(gpio_get_level(DHT_PIN) == 1) { esp_rom_delay_us(1); t++; if(t > 500) { portEXIT_CRITICAL(&mux); return -1; } }
-        if (t > 40) data[i / 8] |= (1 << (7 - (i % 8)));
-    }
-
-    // --- KẾT THÚC VÙNG ƯU TIÊN: Mở lại ngắt cho Wi-Fi ---
-    portEXIT_CRITICAL(&mux);
-
-    // Kiểm tra mã lỗi (Checksum)
-    if (data[4] == ((data[0] + data[1] + data[2] + data[3]) & 0xFF)) {
-        *humidity = data[0] + data[1] * 0.1;
-        *temperature = data[2] + data[3] * 0.1;
-        return 0; // Thành công
-    } else {
-        return -2; // Sai Checksum
+// --- CALLBACK CHO HARDWARE TIMER ---
+static void timer_callback(void* arg) {
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xSemaphoreGiveFromISR(timer_sem, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken) {
+        portYIELD_FROM_ISR();
     }
 }
 
-// ----------------- HÀM MAIN -----------------
-void app_main(void) {
-    // NVS Flash bắt buộc phải khởi tạo trước khi dùng Wi-Fi
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        nvs_flash_erase(); nvs_flash_init();
+// --- TÁC VỤ ĐỌC PMS7003 (SỬ DỤNG UART EVENT/INTERRUPT) ---
+void pms7003_task(void *arg) {
+    uart_config_t uart_config = {
+        .baud_rate = 9600,
+        .data_bits = UART_DATA_8_BITS,
+        .parity    = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT,
+    };
+    uart_param_config(PMS_UART_PORT, &uart_config);
+    uart_set_pin(PMS_UART_PORT, PMS_TX_PIN, PMS_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE);
+    
+    // Cài đặt driver UART với hàng đợi sự kiện (uart_queue)
+    uart_driver_install(PMS_UART_PORT, BUF_SIZE * 2, BUF_SIZE * 2, 20, &uart_queue, 0);
+
+    uart_event_t event;
+    uint8_t* data = (uint8_t*) malloc(BUF_SIZE);
+    
+    while (1) {
+        // Task ngủ, chỉ thức dậy khi có sự kiện UART (Ngắt đẩy vào Queue)
+        if (xQueueReceive(uart_queue, (void * )&event, portMAX_DELAY)) {
+            if (event.type == UART_DATA) {
+                int len = uart_read_bytes(PMS_UART_PORT, data, event.size, portMAX_DELAY);
+                if (len > 0) {
+                    for (int i = 0; i < len - 31; i++) {
+                        if (data[i] == 0x42 && data[i+1] == 0x4D) {
+                            global_pm2_5 = (data[i+12] << 8) | data[i+13];
+                            global_pm10  = (data[i+14] << 8) | data[i+15];
+                            i += 31;
+                        }
+                    }
+                }
+            } else {
+                uart_flush_input(PMS_UART_PORT);
+            }
+        }
     }
+    free(data);
+    vTaskDelete(NULL);
+}
 
-    init_spiffs();
-    wifi_init_sta();
-
-    float temp, hum;
-    char mqtt_payload[100];
+// --- TÁC VỤ THU THẬP DỮ LIỆU ĐỊNH KỲ (ĐÁNH THỨC BỞI TIMER) ---
+void data_collection_task(void *arg) {
+    int16_t temperature = 0, humidity = 0;
+    int64_t last_time = esp_timer_get_time();
+    gpio_set_pull_mode(DHT_PIN, GPIO_PULLUP_ONLY);
 
     while (1) {
-        if (dht_read_data(&hum, &temp) == 0) {
-            ESP_LOGI(TAG, "DHT: Temp=%.1f C, Hum=%.1f %%", temp, hum);
+        // Chờ tín hiệu từ Hardware Timer (Đúng 5 giây 1 lần)
+        if (xSemaphoreTake(timer_sem, portMAX_DELAY) == pdTRUE) {
+            int64_t current_time = esp_timer_get_time();
+            int64_t elapsed = current_time - last_time;
+            int64_t jitter = elapsed - SAMPLING_PERIOD_US;
+            last_time = current_time;
+
+            ESP_LOGI(TAG, "[SAMPLING PROOF] Interval: %lld us | Jitter: %lld us", elapsed, jitter);
+
+            sensor_data_t new_data = {0};
             
-            // 1. Lưu vào Flash (SPIFFS)
-            log_sensor_data(temp, hum);
+            // Đọc DHT11
+            if (dht_read_data(DHT_TYPE_DHT11, DHT_PIN, &humidity, &temperature) == ESP_OK) {
+                new_data.temp = temperature / 10.0;
+                new_data.hum = humidity / 10.0;
+            }
 
-            // 2. Đóng gói chuỗi JSON và Đẩy lên MQTT
-            sprintf(mqtt_payload, "{\"temperature\": %.1f, \"humidity\": %.1f}", temp, hum);
-            esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, mqtt_payload, 0, 1, 0);
-            ESP_LOGI(TAG, "Da day du lieu len MQTT: %s", MQTT_TOPIC);
-        } else {
-            ESP_LOGE(TAG, "Loi doc DHT11, bo qua luot nay.");
+            // Lấy dữ liệu PMS7003 mới nhất từ biến toàn cục
+            new_data.pm25 = global_pm2_5;
+            new_data.pm10 = global_pm10;
+
+            // Đẩy vào Queue cho Task hiển thị & mạng
+            xQueueSend(data_queue, &new_data, portMAX_DELAY);
         }
-
-        vTaskDelay(pdMS_TO_TICKS(10000)); // Đọc và gửi mỗi 10 giây
     }
+}
+
+// --- TÁC VỤ HIỂN THỊ OLED VÀ GỬI MQTT ---
+void display_mqtt_task(void *arg) {
+    sensor_data_t data;
+    char text_buffer[64];
+    char json_payload[128];
+
+    while (1) {
+        // Chờ nhận dữ liệu từ Data Queue
+        if (xQueueReceive(data_queue, &data, portMAX_DELAY) == pdTRUE) {
+            // 1. Cập nhật màn hình OLED
+            ssd1306_clear_screen(&dev, false);
+            sprintf(text_buffer, "Nhiet: %.1f C", data.temp);
+            ssd1306_display_text(&dev, 0, text_buffer, strlen(text_buffer), false);
+            sprintf(text_buffer, "Do Am: %.1f %%", data.hum);
+            ssd1306_display_text(&dev, 2, text_buffer, strlen(text_buffer), false);
+            sprintf(text_buffer, "PM2.5: %d ug", data.pm25);
+            ssd1306_display_text(&dev, 4, text_buffer, strlen(text_buffer), false);
+            sprintf(text_buffer, "PM10 : %d ug", data.pm10);
+            ssd1306_display_text(&dev, 6, text_buffer, strlen(text_buffer), false);
+
+            // 2. Gửi MQTT
+            sprintf(json_payload, "{\"temperature\": %.1f, \"humidity\": %.1f, \"pm25\": %d, \"pm10\": %d}",
+                    data.temp, data.hum, data.pm25, data.pm10);
+            
+            if (mqtt_client != NULL) {
+                esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, json_payload, 0, 1, 0);
+                ESP_LOGI(TAG, "Sent JSON: %s", json_payload);
+            }
+        }
+    }
+}
+
+void app_main(void) {
+    // Khởi tạo NVS
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    // Khởi tạo hiển thị OLED
+    i2c_master_init(&dev, I2C_MASTER_SDA, I2C_MASTER_SCL, -1);
+    ssd1306_init(&dev, 128, 64);
+    ssd1306_clear_screen(&dev, false);
+    ssd1306_display_text(&dev, 2, "Connecting WiFi...", 18, false);
+
+    // Kết nối Wi-Fi & MQTT
+    wifi_init_sta();
+    mqtt_app_start();
+
+    // Khởi tạo RTOS Objects
+    data_queue = xQueueCreate(10, sizeof(sensor_data_t));
+    timer_sem = xSemaphoreCreateBinary();
+
+    // Khởi tạo Hardware Timer (chu kỳ 5 giây)
+    const esp_timer_create_args_t timer_args = {
+        .callback = &timer_callback,
+        .name = "dht_timer"
+    };
+    esp_timer_handle_t dht_timer;
+    ESP_ERROR_CHECK(esp_timer_create(&timer_args, &dht_timer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(dht_timer, SAMPLING_PERIOD_US));
+
+    // Tạo các luồng đa nhiệm
+    xTaskCreatePinnedToCore(pms7003_task, "PMS_Task", 4096, NULL, 5, NULL, 1);
+    xTaskCreatePinnedToCore(data_collection_task, "Data_Task", 4096, NULL, 6, NULL, 1);
+    xTaskCreatePinnedToCore(display_mqtt_task, "Disp_MQTT_Task", 4096, NULL, 4, NULL, 1);
 }

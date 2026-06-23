@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>IoT Dashboard - Trạm Đo Không Khí</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #f4f7f6; display: flex; flex-direction: column; align-items: center; padding: 20px; margin: 0; }
+        h1 { color: #2c3e50; margin-bottom: 5px; text-align: center; }
+        .status { margin-bottom: 20px; font-weight: bold; color: #7f8c8d; }
+        
+        /* Cấu trúc bố cục chính */
+        .dashboard-container { display: flex; flex-direction: column; gap: 20px; align-items: center; width: 100%; max-width: 1200px; }
+        
+        /* Chứa thẻ số liệu: 4 thẻ xếp ngang */
+        .cards { display: flex; flex-direction: row; flex-wrap: wrap; justify-content: center; gap: 20px; width: 100%; }
+        
+        /* CSS cho thẻ hiển thị số */
+        .card { background: white; padding: 20px; border-radius: 12px; box-shadow: 0 5px 15px rgba(0,0,0,0.08); text-align: center; flex: 1; min-width: 200px; max-width: 250px; transition: transform 0.2s; border-top: 4px solid transparent; }
+        .card:hover { transform: translateY(-3px); }
+        .card h2 { margin: 0; color: #34495e; font-size: 18px; }
+        .value { font-size: 36px; font-weight: bold; margin: 10px 0; }
+        .time { font-size: 12px; color: #95a5a6; }
+
+        /* Phối màu riêng cho từng loại cảm biến */
+        #temp-card { border-top-color: #e74c3c; }
+        .temp-val { color: #e74c3c; }
+        
+        #hum-card { border-top-color: #3498db; }
+        .hum-val { color: #3498db; }
+
+        #pm25-card { border-top-color: #f39c12; }
+        .pm25-val { color: #f39c12; }
+
+        #pm10-card { border-top-color: #8e44ad; }
+        .pm10-val { color: #8e44ad; }
+        
+        /* CSS khu vực Canvas đồ thị (ĐÃ ĐƯỢC FIX LỖI) */
+        .chart-container { 
+            background: white; 
+            padding: 20px; 
+            border-radius: 12px; 
+            box-shadow: 0 5px 15px rgba(0,0,0,0.08); 
+            width: 100%; 
+            box-sizing: border-box; 
+            position: relative; /* Bắt buộc để Chart.js tự căn kích thước */
+            height: 450px;      /* Chuyển chiều cao từ thẻ canvas sang thẻ div chứa nó */
+        }
+        
+        /* Hiệu ứng nháy sáng khi có dữ liệu mới */
+        @keyframes flash-green { 0% { background-color: #d4edda; } 100% { background-color: white; } }
+        .flash { animation: flash-green 0.8s ease-out; }
+    </style>
+</head>
+<body>
+
+    <h1>Trạm Quan Trắc Không Khí IoT</h1>
+    <div class="status" id="connection-status">Trạng thái: Đang kết nối...</div>
+
+    <div class="dashboard-container">
+        <div class="cards">
+            <div class="card" id="temp-card">
+                <h2>Nhiệt Độ</h2>
+                <div class="value temp-val"><span id="temp">--</span>°C</div>
+                <div class="time" id="temp-time">Cập nhật: --:--:--</div>
+            </div>
+            <div class="card" id="hum-card">
+                <h2>Độ Ẩm</h2>
+                <div class="value hum-val"><span id="hum">--</span>%</div>
+                <div class="time" id="hum-time">Cập nhật: --:--:--</div>
+            </div>
+            <div class="card" id="pm25-card">
+                <h2>Bụi Mịn PM 2.5</h2>
+                <div class="value pm25-val"><span id="pm25">--</span> µg</div>
+                <div class="time" id="pm25-time">Cập nhật: --:--:--</div>
+            </div>
+            <div class="card" id="pm10-card">
+                <h2>Bụi PM 10</h2>
+                <div class="value pm10-val"><span id="pm10">--</span> µg</div>
+                <div class="time" id="pm10-time">Cập nhật: --:--:--</div>
+            </div>
+        </div>
+
+        <div class="chart-container">
+            <canvas id="iotChart"></canvas>
+        </div>
+    </div>
+
+    <script>
+        // --- 1. KHỞI TẠO BIỂU ĐỒ (CHART.JS) ---
+        const ctx = document.getElementById('iotChart').getContext('2d');
+        const iotChart = new Chart(ctx, {
+            type: 'line',
+            data: {
+                labels: [], 
+                datasets: [
+                    {
+                        label: 'Nhiệt độ (°C)',
+                        borderColor: '#e74c3c', backgroundColor: 'rgba(231, 76, 60, 0.1)',
+                        data: [], borderWidth: 2, tension: 0.3, yAxisID: 'y'
+                    },
+                    {
+                        label: 'Độ ẩm (%)',
+                        borderColor: '#3498db', backgroundColor: 'rgba(52, 152, 219, 0.1)',
+                        data: [], borderWidth: 2, tension: 0.3, yAxisID: 'y'
+                    },
+                    {
+                        label: 'PM 2.5 (µg/m³)',
+                        borderColor: '#f39c12', backgroundColor: 'rgba(243, 156, 18, 0.1)',
+                        data: [], borderWidth: 2, tension: 0.3, yAxisID: 'y1'
+                    },
+                    {
+                        label: 'PM 10 (µg/m³)',
+                        borderColor: '#8e44ad', backgroundColor: 'rgba(142, 68, 173, 0.1)',
+                        data: [], borderWidth: 2, tension: 0.3, yAxisID: 'y1'
+                    }
+                ]
+            },
+            options: {
+                responsive: true, 
+                maintainAspectRatio: false,
+                interaction: { mode: 'index', intersect: false },
+                scales: {
+                    y: { type: 'linear', display: true, position: 'left', title: { display: true, text: 'Nhiệt độ (°C) / Độ ẩm (%)' } },
+                    y1: { type: 'linear', display: true, position: 'right', title: { display: true, text: 'Nồng độ bụi (µg/m³)' }, grid: { drawOnChartArea: false } }
+                },
+                animation: { duration: 400 } 
+            }
+        });
+
+        function flashCard(cardId) {
+            const card = document.getElementById(cardId);
+            card.classList.remove('flash');
+            void card.offsetWidth; 
+            card.classList.add('flash');
+        }
+
+        let lastUpdateTime = "";
+
+        // --- 1.5. LẤY DỮ LIỆU TỪ BACKEND FLASK ---
+        function fetchData() {
+            fetch('/api/history')
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error("Lỗi HTTP: " + response.status);
+                    }
+                    return response.json();
+                })
+                .then(data => {
+                    const statusEl = document.getElementById('connection-status');
+                    
+                    if(data.labels && data.labels.length > 0) {
+                        let lastIdx = data.labels.length - 1;
+                        let latestTime = data.labels[lastIdx];
+                        
+                        // Chỉ cập nhật giao diện nếu có dữ liệu mới từ backend
+                        if (latestTime !== lastUpdateTime) {
+                            lastUpdateTime = latestTime;
+                            
+                            // Cập nhật Chart
+                            iotChart.data.labels = data.labels;
+                            iotChart.data.datasets[0].data = data.temp;
+                            iotChart.data.datasets[1].data = data.hum;
+                            iotChart.data.datasets[2].data = data.pm25;
+                            iotChart.data.datasets[3].data = data.pm10;
+                            iotChart.update();
+                            
+                            // Cập nhật số liệu trên các thẻ card bằng điểm dữ liệu cuối cùng
+                            document.getElementById('temp').innerText = data.temp[lastIdx];
+                            document.getElementById('hum').innerText = data.hum[lastIdx];
+                            document.getElementById('pm25').innerText = data.pm25[lastIdx];
+                            document.getElementById('pm10').innerText = data.pm10[lastIdx];
+                            
+                            const timeString = "Cập nhật: " + latestTime;
+                            document.getElementById('temp-time').innerText = timeString;
+                            document.getElementById('hum-time').innerText = timeString;
+                            document.getElementById('pm25-time').innerText = timeString;
+                            document.getElementById('pm10-time').innerText = timeString;
+
+                            flashCard('temp-card');
+                            flashCard('hum-card');
+                            flashCard('pm25-card');
+                            flashCard('pm10-card');
+                        }
+                        statusEl.textContent = "Trạng thái: Đã kết nối ESP32 🟢";
+                        statusEl.style.color = "#198754";
+                    } else {
+                        statusEl.textContent = "Trạng thái: Đã kết nối Web, đang chờ dữ liệu từ ESP32 🟡";
+                        statusEl.style.color = "#d39e00";
+                    }
+                })
+                .catch(err => {
+                    console.error("Không thể lấy dữ liệu:", err);
+                    const statusEl = document.getElementById('connection-status');
+                    statusEl.textContent = "Trạng thái: Mất kết nối máy chủ 🔴";
+                    statusEl.style.color = "#dc3545";
+                });
+        }
+
+        // Chạy hàm lấy lịch sử ngay khi tải xong giao diện
+        fetchData();
+        // Cập nhật định kỳ mỗi 5 giây (đồng bộ với chu kỳ 5s của phần cứng)
+        setInterval(fetchData, 5000);
+    </script>
+</body>
+</html>
