@@ -1,6 +1,7 @@
 #ifndef MAIN_SSD1306_H_
 #define MAIN_SSD1306_H_
 
+#include "esp_idf_version.h"
 #include "driver/spi_master.h"
 #if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0))
 #include "driver/i2c_master.h"
@@ -140,6 +141,8 @@ void ssd1306_display_text_x3(SSD1306_t * dev, int page, const char * text, int t
 void ssd1306_clear_screen(SSD1306_t * dev, bool invert);
 void ssd1306_clear_line(SSD1306_t * dev, int page, bool invert);
 void ssd1306_contrast(SSD1306_t * dev, int contrast);
+void ssd1306_display_on(SSD1306_t * dev);
+void ssd1306_display_off(SSD1306_t * dev);
 void ssd1306_software_scroll(SSD1306_t * dev, int start, int end);
 void ssd1306_scroll_text(SSD1306_t * dev, const char * text, int text_len, bool invert);
 void ssd1306_scroll_clear(SSD1306_t * dev);

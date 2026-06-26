@@ -23,9 +23,10 @@
 // Thư viện ngoại vi
 #include "ssd1306.h"
 #include "dht.h"
+#include "oled_sleep.h"
 
-#define WIFI_SSID       "iPhone"
-#define WIFI_PASS       "123456789"
+#define WIFI_SSID       "Galaxy A23 5G57E5"
+#define WIFI_PASS       "dietphatxit"
 #define MQTT_URI        "mqtts://2cf8a119a7c74d3891fc09c9ca7136f9.s1.eu.hivemq.cloud:8883"
 #define MQTT_TOPIC      "hust/kien/air_quality"
 
@@ -224,16 +225,18 @@ void display_mqtt_task(void *arg) {
     while (1) {
         // Chờ nhận dữ liệu từ Data Queue
         if (xQueueReceive(data_queue, &data, portMAX_DELAY) == pdTRUE) {
-            // 1. Cập nhật màn hình OLED
-            ssd1306_clear_screen(&dev, false);
-            sprintf(text_buffer, "Nhiet: %.1f C", data.temp);
-            ssd1306_display_text(&dev, 0, text_buffer, strlen(text_buffer), false);
-            sprintf(text_buffer, "Do Am: %.1f %%", data.hum);
-            ssd1306_display_text(&dev, 2, text_buffer, strlen(text_buffer), false);
-            sprintf(text_buffer, "PM2.5: %d ug", data.pm25);
-            ssd1306_display_text(&dev, 4, text_buffer, strlen(text_buffer), false);
-            sprintf(text_buffer, "PM10 : %d ug", data.pm10);
-            ssd1306_display_text(&dev, 6, text_buffer, strlen(text_buffer), false);
+            // 1. Cập nhật màn hình OLED (chỉ khi không ở chế độ sleep)
+            if (!oled_sleep_is_sleeping()) {
+                ssd1306_clear_screen(&dev, false);
+                sprintf(text_buffer, "Nhiet: %.1f C", data.temp);
+                ssd1306_display_text(&dev, 0, text_buffer, strlen(text_buffer), false);
+                sprintf(text_buffer, "Do Am: %.1f %%", data.hum);
+                ssd1306_display_text(&dev, 2, text_buffer, strlen(text_buffer), false);
+                sprintf(text_buffer, "PM2.5: %d ug", data.pm25);
+                ssd1306_display_text(&dev, 4, text_buffer, strlen(text_buffer), false);
+                sprintf(text_buffer, "PM10 : %d ug", data.pm10);
+                ssd1306_display_text(&dev, 6, text_buffer, strlen(text_buffer), false);
+            }
 
             // 2. Gửi MQTT
             sprintf(json_payload, "{\"temperature\": %.1f, \"humidity\": %.1f, \"pm25\": %d, \"pm10\": %d}",
@@ -265,6 +268,9 @@ void app_main(void) {
     // Kết nối Wi-Fi & MQTT
     wifi_init_sta();
     mqtt_app_start();
+
+    // Khởi tạo tính năng sleep cho màn hình (5 phút ngủ, 10s thức)
+    oled_sleep_init(&dev);
 
     // Khởi tạo RTOS Objects
     data_queue = xQueueCreate(10, sizeof(sensor_data_t));

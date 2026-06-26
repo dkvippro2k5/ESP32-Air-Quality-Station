@@ -280,6 +280,52 @@ void ssd1306_contrast(SSD1306_t * dev, int contrast)
 	}
 }
 
+void ssd1306_display_on(SSD1306_t * dev)
+{
+	if (dev->_address == SPI_ADDRESS) {
+		spi_master_write_command(dev, OLED_CMD_DISPLAY_ON);
+	} else {
+#if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0))
+		uint8_t out_buf[2];
+		out_buf[0] = OLED_CONTROL_BYTE_CMD_STREAM;
+		out_buf[1] = OLED_CMD_DISPLAY_ON;
+		i2c_master_transmit(dev->_i2c_dev_handle, out_buf, 2, 100);
+#else
+		i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+		i2c_master_start(cmd);
+		i2c_master_write_byte(cmd, (dev->_address << 1) | I2C_MASTER_WRITE, true);
+		i2c_master_write_byte(cmd, OLED_CONTROL_BYTE_CMD_STREAM, true);
+		i2c_master_write_byte(cmd, OLED_CMD_DISPLAY_ON, true);
+		i2c_master_stop(cmd);
+		i2c_master_cmd_begin(dev->_i2c_num, cmd, 100);
+		i2c_cmd_link_delete(cmd);
+#endif
+	}
+}
+
+void ssd1306_display_off(SSD1306_t * dev)
+{
+	if (dev->_address == SPI_ADDRESS) {
+		spi_master_write_command(dev, OLED_CMD_DISPLAY_OFF);
+	} else {
+#if (ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 2, 0))
+		uint8_t out_buf[2];
+		out_buf[0] = OLED_CONTROL_BYTE_CMD_STREAM;
+		out_buf[1] = OLED_CMD_DISPLAY_OFF;
+		i2c_master_transmit(dev->_i2c_dev_handle, out_buf, 2, 100);
+#else
+		i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+		i2c_master_start(cmd);
+		i2c_master_write_byte(cmd, (dev->_address << 1) | I2C_MASTER_WRITE, true);
+		i2c_master_write_byte(cmd, OLED_CONTROL_BYTE_CMD_STREAM, true);
+		i2c_master_write_byte(cmd, OLED_CMD_DISPLAY_OFF, true);
+		i2c_master_stop(cmd);
+		i2c_master_cmd_begin(dev->_i2c_num, cmd, 100);
+		i2c_cmd_link_delete(cmd);
+#endif
+	}
+}
+
 void ssd1306_software_scroll(SSD1306_t * dev, int start, int end)
 {
 	ESP_LOGD(__FUNCTION__, "software_scroll start=%d end=%d _pages=%d", start, end, dev->_pages);
