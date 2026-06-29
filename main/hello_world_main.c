@@ -24,9 +24,10 @@
 #include "ssd1306.h"
 #include "dht.h"
 #include "oled_sleep.h"
+#include "sampling_proof.h"
 
-#define WIFI_SSID       "Galaxy A23 5G57E5"
-#define WIFI_PASS       "dietphatxit"
+#define WIFI_SSID       "P818"
+#define WIFI_PASS       "0988672973"
 #define MQTT_URI        "mqtts://2cf8a119a7c74d3891fc09c9ca7136f9.s1.eu.hivemq.cloud:8883"
 #define MQTT_TOPIC      "hust/kien/air_quality"
 
@@ -40,6 +41,7 @@
 
 // Cấu hình chu kỳ lấy mẫu (5 giây = 5.000.000 micro giây)
 #define SAMPLING_PERIOD_US 5000000
+#define SAMPLING_WINDOW_US (30 * 60 * 1000000ULL)
 
 static const char *TAG = "TRAM_IOT_MAIN";
 static EventGroupHandle_t s_wifi_event_group;
@@ -188,6 +190,8 @@ void data_collection_task(void *arg) {
     int64_t last_time = esp_timer_get_time();
     gpio_set_pull_mode(DHT_PIN, GPIO_PULLUP_ONLY);
 
+    sampling_proof_init(SAMPLING_PERIOD_US, SAMPLING_WINDOW_US);
+
     while (1) {
         // Chờ tín hiệu từ Hardware Timer (Đúng 5 giây 1 lần)
         if (xSemaphoreTake(timer_sem, portMAX_DELAY) == pdTRUE) {
@@ -197,6 +201,8 @@ void data_collection_task(void *arg) {
             last_time = current_time;
 
             ESP_LOGI(TAG, "[SAMPLING PROOF] Interval: %lld us | Jitter: %lld us", elapsed, jitter);
+
+            sampling_proof_record_sample();
 
             sensor_data_t new_data = {0};
             
