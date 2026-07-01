@@ -13,5 +13,6 @@
  */
 void oled_sleep_init(SSD1306_t * dev);
 bool oled_sleep_is_sleeping(void);
+void oled_sleep_wake_up_isr(void* arg);
 
 #endif // OLED_SLEEP_H

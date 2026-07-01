@@ -26,8 +26,8 @@
 #include "oled_sleep.h"
 #include "sampling_proof.h"
 
-#define WIFI_SSID       "P818"
-#define WIFI_PASS       "0988672973"
+#define WIFI_SSID       "102"
+#define WIFI_PASS       "B131021234"
 #define MQTT_URI        "mqtts://2cf8a119a7c74d3891fc09c9ca7136f9.s1.eu.hivemq.cloud:8883"
 #define MQTT_TOPIC      "hust/kien/air_quality"
 
@@ -36,6 +36,7 @@
 #define PMS_RX_PIN      GPIO_NUM_16 
 #define BUF_SIZE        (1024)
 #define DHT_PIN         GPIO_NUM_4
+#define BOOT_BUTTON_PIN GPIO_NUM_0
 #define I2C_MASTER_SDA  21
 #define I2C_MASTER_SCL  22
 
@@ -275,8 +276,24 @@ void app_main(void) {
     wifi_init_sta();
     mqtt_app_start();
 
-    // Khởi tạo tính năng sleep cho màn hình (5 phút ngủ, 10s thức)
+    // Khởi tạo tính năng sleep cho màn hình
     oled_sleep_init(&dev);
+
+    // Cấu hình nút BOOT (GPIO 0) làm Ngắt ngoài để đánh thức OLED
+    gpio_config_t btn_cfg = {
+        .pin_bit_mask = (1ULL << BOOT_BUTTON_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_NEGEDGE
+    };
+    ESP_ERROR_CHECK(gpio_config(&btn_cfg));
+    
+    esp_err_t isr_err = gpio_install_isr_service(0);
+    if (isr_err != ESP_OK && isr_err != ESP_ERR_INVALID_STATE) {
+        ESP_ERROR_CHECK(isr_err);
+    }
+    ESP_ERROR_CHECK(gpio_isr_handler_add(BOOT_BUTTON_PIN, oled_sleep_wake_up_isr, NULL));
 
     // Khởi tạo RTOS Objects
     data_queue = xQueueCreate(10, sizeof(sensor_data_t));
