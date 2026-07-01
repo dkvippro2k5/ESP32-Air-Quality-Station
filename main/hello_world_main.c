@@ -64,6 +64,7 @@ typedef struct {
     float hum;
     int pm25;
     int pm10;
+    int32_t jitter;
 } sensor_data_t;
 
 // --- QUẢN LÝ SỰ KIỆN WIFI ---
@@ -102,6 +103,9 @@ void wifi_init_sta(void) {
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
     ESP_ERROR_CHECK(esp_wifi_start());
+    
+    // Giảm công suất phát Wi-Fi xuống mức 8.5 dBm (34 * 0.25) để tiết kiệm pin
+    ESP_ERROR_CHECK(esp_wifi_set_max_tx_power(34));
     
     xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
 }
@@ -206,6 +210,7 @@ void data_collection_task(void *arg) {
             sampling_proof_record_sample();
 
             sensor_data_t new_data = {0};
+            new_data.jitter = (int32_t)jitter;
             
             // Đọc DHT11
             if (dht_read_data(DHT_TYPE_DHT11, DHT_PIN, &humidity, &temperature) == ESP_OK) {
@@ -246,11 +251,12 @@ void display_mqtt_task(void *arg) {
             }
 
             // 2. Gửi MQTT
-            sprintf(json_payload, "{\"temperature\": %.1f, \"humidity\": %.1f, \"pm25\": %d, \"pm10\": %d}",
-                    data.temp, data.hum, data.pm25, data.pm10);
+            sprintf(json_payload, "{\"temperature\": %.1f, \"humidity\": %.1f, \"pm25\": %d, \"pm10\": %d, \"jitter\": %ld}",
+                    data.temp, data.hum, data.pm25, data.pm10, (long)data.jitter);
             
             if (mqtt_client != NULL) {
-                esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, json_payload, 0, 1, 0);
+                // Gửi với QoS 0 (Tham số thứ 5) để không phải chờ ACK, tiết kiệm pin Wi-Fi
+                esp_mqtt_client_publish(mqtt_client, MQTT_TOPIC, json_payload, 0, 0, 0);
                 ESP_LOGI(TAG, "Sent JSON: %s", json_payload);
             }
         }
