@@ -50,6 +50,10 @@ static EventGroupHandle_t s_wifi_event_group;
 
 volatile int global_pm2_5 = 0;
 volatile int global_pm10  = 0;
+static SemaphoreHandle_t pm_mutex = NULL;
+static uint32_t seq_num = 0;
+volatile int64_t last_hw_timer_isr_time = 0;
+volatile int32_t latest_hw_jitter = 0;
 
 SSD1306_t dev;
 esp_mqtt_client_handle_t mqtt_client = NULL;
@@ -64,7 +68,8 @@ typedef struct {
     float hum;
     int pm25;
     int pm10;
-    int32_t jitter;
+    int32_t hw_jitter;
+    int32_t sched_latency;
 } sensor_data_t;
 
 // --- QUẢN LÝ SỰ KIỆN WIFI ---
@@ -140,6 +145,12 @@ void mqtt_app_start(void) {
 
 // --- CALLBACK CHO HARDWARE TIMER ---
 static void timer_callback(void* arg) {
+    int64_t now = esp_timer_get_time();
+    if (last_hw_timer_isr_time != 0) {
+        latest_hw_jitter = (int32_t)((now - last_hw_timer_isr_time) - SAMPLING_PERIOD_US);
+    }
+    last_hw_timer_isr_time = now;
+
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
     xSemaphoreGiveFromISR(timer_sem, &xHigherPriorityTaskWoken);
     if (xHigherPriorityTaskWoken) {
@@ -174,8 +185,19 @@ void pms7003_task(void *arg) {
                 if (len > 0) {
                     for (int i = 0; i < len - 31; i++) {
                         if (data[i] == 0x42 && data[i+1] == 0x4D) {
-                            global_pm2_5 = (data[i+12] << 8) | data[i+13];
-                            global_pm10  = (data[i+14] << 8) | data[i+15];
+                            uint16_t checksum = 0;
+                            for (int j = 0; j < 30; j++) {
+                                checksum += data[i + j];
+                            }
+                            uint16_t expected_checksum = (data[i+30] << 8) | data[i+31];
+                            
+                            if (checksum == expected_checksum) {
+                                if (xSemaphoreTake(pm_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                                    global_pm2_5 = (data[i+12] << 8) | data[i+13];
+                                    global_pm10  = (data[i+14] << 8) | data[i+15];
+                                    xSemaphoreGive(pm_mutex);
+                                }
+                            }
                             i += 31;
                         }
                     }
@@ -202,28 +224,48 @@ void data_collection_task(void *arg) {
         if (xSemaphoreTake(timer_sem, portMAX_DELAY) == pdTRUE) {
             int64_t current_time = esp_timer_get_time();
             int64_t elapsed = current_time - last_time;
-            int64_t jitter = elapsed - SAMPLING_PERIOD_US;
+            
+            // Tính toán Jitter rạch ròi
+            int32_t sched_latency = (int32_t)(current_time - last_hw_timer_isr_time);
+            int32_t hw_jitter = latest_hw_jitter;
             last_time = current_time;
 
-            ESP_LOGI(TAG, "[SAMPLING PROOF] Interval: %lld us | Jitter: %lld us", elapsed, jitter);
+            ESP_LOGI(TAG, "[SAMPLING PROOF] Hardware Jitter: %ld us | Sched Latency: %ld us", hw_jitter, sched_latency);
 
             sampling_proof_record_sample();
 
             sensor_data_t new_data = {0};
-            new_data.jitter = (int32_t)jitter;
+            new_data.hw_jitter = hw_jitter;
+            new_data.sched_latency = sched_latency;
+            
+            // Giữ lại số liệu cũ nếu DHT11 lỗi
+            static float last_valid_temp = 0.0;
+            static float last_valid_hum = 0.0;
             
             // Đọc DHT11
             if (dht_read_data(DHT_TYPE_DHT11, DHT_PIN, &humidity, &temperature) == ESP_OK) {
-                new_data.temp = temperature / 10.0;
-                new_data.hum = humidity / 10.0;
+                last_valid_temp = temperature / 10.0;
+                last_valid_hum = humidity / 10.0;
+            } else {
+                ESP_LOGW(TAG, "DHT11 doc loi, dung lai du lieu cu!");
+            }
+            new_data.temp = last_valid_temp;
+            new_data.hum = last_valid_hum;
+
+            // Lấy dữ liệu PMS7003 mới nhất từ biến toàn cục có bảo vệ Mutex
+            if (xSemaphoreTake(pm_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+                new_data.pm25 = global_pm2_5;
+                new_data.pm10 = global_pm10;
+                xSemaphoreGive(pm_mutex);
+            } else {
+                new_data.pm25 = global_pm2_5;
+                new_data.pm10 = global_pm10;
             }
 
-            // Lấy dữ liệu PMS7003 mới nhất từ biến toàn cục
-            new_data.pm25 = global_pm2_5;
-            new_data.pm10 = global_pm10;
-
-            // Đẩy vào Queue cho Task hiển thị & mạng
-            xQueueSend(data_queue, &new_data, portMAX_DELAY);
+            // Đẩy vào Queue (Chờ tối đa 50ms, không chờ vô hạn)
+            if (xQueueSend(data_queue, &new_data, pdMS_TO_TICKS(50)) != pdTRUE) {
+                ESP_LOGE(TAG, "Queue day, bo qua goi tin de giu nhip 5s!");
+            }
         }
     }
 }
@@ -251,8 +293,9 @@ void display_mqtt_task(void *arg) {
             }
 
             // 2. Gửi MQTT
-            sprintf(json_payload, "{\"temperature\": %.1f, \"humidity\": %.1f, \"pm25\": %d, \"pm10\": %d, \"jitter\": %ld}",
-                    data.temp, data.hum, data.pm25, data.pm10, (long)data.jitter);
+            seq_num++;
+            sprintf(json_payload, "{\"seq_num\": %lu, \"temperature\": %.1f, \"humidity\": %.1f, \"pm25\": %d, \"pm10\": %d, \"hw_jitter\": %ld, \"sched_latency\": %ld}",
+                    seq_num, data.temp, data.hum, data.pm25, data.pm10, (long)data.hw_jitter, (long)data.sched_latency);
             
             if (mqtt_client != NULL) {
                 // Gửi với QoS 0 (Tham số thứ 5) để không phải chờ ACK, tiết kiệm pin Wi-Fi
@@ -302,6 +345,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(gpio_isr_handler_add(BOOT_BUTTON_PIN, oled_sleep_wake_up_isr, NULL));
 
     // Khởi tạo RTOS Objects
+    pm_mutex = xSemaphoreCreateMutex();
     data_queue = xQueueCreate(10, sizeof(sensor_data_t));
     timer_sem = xSemaphoreCreateBinary();
 

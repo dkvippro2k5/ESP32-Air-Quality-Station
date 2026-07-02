@@ -28,7 +28,7 @@ MAX_POINTS = 20
 try:
     with open(CSV_FILE, mode='x', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(["Thoi Gian", "Nhiet Do (C)", "Do Am (%)", "PM2.5 (ug/m3)", "PM10 (ug/m3)"])
+        writer.writerow(["Thoi Gian", "Seq Num", "Nhiet Do (C)", "Do Am (%)", "PM2.5 (ug/m3)", "PM10 (ug/m3)"])
 except FileExistsError:
     pass
 
@@ -36,7 +36,7 @@ JITTER_CSV_FILE = os.path.join(BASE_DIR, "high_jitter_logs.csv")
 try:
     with open(JITTER_CSV_FILE, mode='x', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
-        writer.writerow(["Thoi Gian", "Nhiet Do (C)", "Do Am (%)", "PM2.5 (ug/m3)", "PM10 (ug/m3)", "Jitter (us)", "Phan Loai"])
+        writer.writerow(["Thoi Gian", "Seq Num", "Nhiet Do (C)", "Do Am (%)", "PM2.5 (ug/m3)", "PM10 (ug/m3)", "HW Jitter (us)", "Sched Latency (us)", "Phan Loai"])
 except FileExistsError:
     pass
 
@@ -52,11 +52,13 @@ def on_connect(client, userdata, flags, rc, properties=None):
 def on_message(client, userdata, msg):
     try:
         payload = json.loads(msg.payload.decode('utf-8'))
+        seq_num = payload.get("seq_num", 0)
         temp = payload.get("temperature", 0.0)
         hum = payload.get("humidity", 0.0)
         pm25 = payload.get("pm25", 0)
         pm10 = payload.get("pm10", 0)
-        jitter = payload.get("jitter", 0)
+        hw_jitter = payload.get("hw_jitter", 0)
+        sched_latency = payload.get("sched_latency", 0)
         
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         short_time = datetime.now().strftime("%H:%M:%S")
@@ -65,33 +67,41 @@ def on_message(client, userdata, msg):
 
         current_log = {
             'time': current_time,
+            'seq_num': seq_num,
             'temp': temp,
             'hum': hum,
             'pm25': pm25,
             'pm10': pm10,
-            'jitter': jitter,
+            'hw_jitter': hw_jitter,
+            'sched_latency': sched_latency,
             'saved_as_high': False
         }
 
         # 1. Ghi vào CSV tổng
         with open(CSV_FILE, mode='a', newline='', encoding='utf-8') as f:
-            csv.writer(f).writerow([current_time, temp, hum, pm25, pm10])
-        print(f"[{short_time}] Đã lưu CSV: Temp={temp}, Hum={hum}, PM2.5={pm25}, PM10={pm10} | Sai số Jitter: {jitter} us")
+            csv.writer(f).writerow([current_time, seq_num, temp, hum, pm25, pm10])
+            
+        # Cảnh báo rớt gói PDR nếu seq_num bị nhảy cóc
+        if prev_log and prev_log.get('seq_num', 0) != 0 and seq_num > prev_log['seq_num'] + 1:
+            dropped = seq_num - prev_log['seq_num'] - 1
+            print(f"  [CẢNH BÁO PDR] Phát hiện rớt {dropped} gói tin MQTT (Do QoS 0)!")
 
-        # 2. Xử lý Jitter > 500us
-        is_high_jitter = abs(jitter) > 500
+        print(f"[{short_time}] SEQ: {seq_num} | Temp={temp}, Hum={hum}, PM2.5={pm25}, PM10={pm10} | HW Jitter: {hw_jitter}us, Sched Latency: {sched_latency}us")
+
+        # 2. Xử lý Scheduling Latency > 500us
+        is_high_jitter = abs(sched_latency) > 500
 
         def save_to_jitter_csv(log_data, note):
             with open(JITTER_CSV_FILE, mode='a', newline='', encoding='utf-8') as f:
-                csv.writer(f).writerow([log_data['time'], log_data['temp'], log_data['hum'], log_data['pm25'], log_data['pm10'], log_data['jitter'], note])
+                csv.writer(f).writerow([log_data['time'], log_data['seq_num'], log_data['temp'], log_data['hum'], log_data['pm25'], log_data['pm10'], log_data['hw_jitter'], log_data['sched_latency'], note])
 
         if is_high_jitter:
-            print(f"  --> PHÁT HIỆN JITTER CAO: {jitter} us!")
+            print(f"  --> PHÁT HIỆN TRỄ LẬP LỊCH CAO: {sched_latency} us!")
             # Nếu có log trước đó và log đó chưa từng bị lưu với nhãn Jitter cao
             if prev_log and not prev_log.get("saved_as_high"):
                 save_to_jitter_csv(prev_log, "Log truoc do")
             
-            save_to_jitter_csv(current_log, "JITTER CAO > 500us")
+            save_to_jitter_csv(current_log, "LATENCY CAO > 500us")
             current_log['saved_as_high'] = True
             save_next_log = True
         else:
